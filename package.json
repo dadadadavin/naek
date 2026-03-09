@@ -1,0 +1,20 @@
+{
+  "name": "naek",
+  "version": "1.0.0",
+  "description": "WhatsApp remote control for Antigravity IDE",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "keywords": ["whatsapp", "antigravity", "remote-control", "cdp"],
+  "author": "dadadadavin",
+  "license": "MIT",
+  "dependencies": {
+    "baileys": "^6.7.16",
+    "chrome-remote-interface": "^0.33.2",
+    "dotenv": "^16.4.7",
+    "pino": "^9.6.0",
+    "qrcode-terminal": "^0.12.0"
+  }
+}

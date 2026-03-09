@@ -1,5 +1,9 @@
 # ========================
-# OS Generated Files
+# Project Specific
+# ========================
+auth_info/
+node_modules/
+
 # ========================
 .DS_Store
 .DS_Store?
@@ -71,3 +75,9 @@ temp/
 coverage/
 .nyc_output/
 *.lcov
+test_*.js
+out*.txt
+out.txt
+targets.json
+out_html.html
+*.log
