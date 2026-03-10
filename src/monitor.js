@@ -83,7 +83,16 @@ function startPolling(intervalMs = 2000) {
         }
       } else if (hasContent && currentHash === lastResponseHash) {
         // Same content as last poll → maybe done
-        stableCount++;
+        // FIX audit-v2 #2: Check if AI is still generating before declaring stable
+        var stillGenerating = false;
+        try { stillGenerating = await cdp.isGenerating(); } catch(e) {}
+        
+        if (stillGenerating) {
+          // AI is still working, don't count as stable
+          stableCount = 0;
+        } else {
+          stableCount++;
+        }
 
         if (stableCount >= 2) {
           const formatted = formatResponse(lastResponseText);

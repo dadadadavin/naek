@@ -181,23 +181,28 @@ async function getLatestResponse() {
           if (txt.indexOf("Gemini ") === 0) continue;
           if (txt.indexOf("Claude ") === 0) continue;
           if (txt.indexOf("GPT-OSS ") === 0) continue;
-          // Skip "Thought for Xs" pattern
-          if (/^Thought for \\d/.test(txt)) continue;
-          // Skip "N Files With Changes"
-          if (/^\\d+ Files? With Changes$/.test(txt)) continue;
-          // Skip file paths
-          if (/^d:\\\\/.test(txt)) continue;
-          if (/^> node /.test(txt)) continue;
-          // Skip exit codes
-          if (/^Exit code \\d+$/.test(txt)) continue;
-          // Skip CSS selectors: lines starting with . followed by class names and {
-          if (/^\\.[-a-zA-Z_]/.test(txt)) continue;
-          // Skip CSS property lines: "property-name: value;"
-          if (/^[a-z-]+:\\s.*[;{}]/.test(txt)) continue;
+          // Skip "Thought for Xs" — check prefix + digit after
+          if (txt.indexOf("Thought for ") === 0) continue;
+          // Skip "N Files With Changes" — starts with digit
+          if (txt.charAt(0) >= "0" && txt.charAt(0) <= "9" && txt.indexOf("Files") !== -1) continue;
+          // Skip file paths like d:\yaru\...
+          if (txt.indexOf("d:" + String.fromCharCode(92)) === 0) continue;
+          // Skip "> node ..." lines
+          if (txt.indexOf("> node ") === 0) continue;
+          // Skip "Exit code N"
+          if (txt.indexOf("Exit code ") === 0) continue;
+          // Skip CSS selectors: starts with . then a letter
+          if (txt.charAt(0) === "." && txt.length > 1 && txt.charAt(1) >= "a" && txt.charAt(1) <= "z") continue;
+          // Skip CSS property lines: "word-word: value;"
+          if (txt.indexOf(": ") > 0 && (txt.indexOf(";") !== -1 || txt.indexOf("{") !== -1)) {
+            var colonPos = txt.indexOf(": ");
+            var beforeColon = txt.substring(0, colonPos);
+            if (beforeColon.length < 30 && beforeColon.indexOf(" ") === -1) continue;
+          }
           // Skip large CSS blocks
-          if (txt.length > 300 && txt.indexOf('{') !== -1 && txt.indexOf('}') !== -1) continue;
-          // Skip Step Id lines
-          if (/^Step Id: \\d+$/.test(txt)) continue;
+          if (txt.length > 300 && txt.indexOf("{") !== -1 && txt.indexOf("}") !== -1) continue;
+          // Skip "Step Id: N"
+          if (txt.indexOf("Step Id: ") === 0) continue;
           filtered.push(txt);
         }
         
@@ -213,7 +218,7 @@ async function getLatestResponse() {
           filtered = filtered.slice(filtered.length - maxNodes);
         }
         
-        return filtered.join("\\n");
+        return filtered.join(String.fromCharCode(10));
       })()`,
       returnByValue: true,
     });
