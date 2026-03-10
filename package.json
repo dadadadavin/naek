@@ -7,10 +7,16 @@
     "start": "node src/index.js",
     "dev": "node --watch src/index.js"
   },
-  "keywords": ["whatsapp", "antigravity", "remote-control", "cdp"],
+  "keywords": [
+    "whatsapp",
+    "antigravity",
+    "remote-control",
+    "cdp"
+  ],
   "author": "dadadadavin",
   "license": "MIT",
   "dependencies": {
+    "@hapi/boom": "^10.0.1",
     "baileys": "^6.7.16",
     "chrome-remote-interface": "^0.33.2",
     "dotenv": "^16.4.7",

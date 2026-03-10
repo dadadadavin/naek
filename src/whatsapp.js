@@ -42,14 +42,36 @@ async function initWhatsApp() {
     }
 
     if (connection === 'close') {
-      const statusCode = lastDisconnect?.error?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
+      const boomError = lastDisconnect?.error;
+      const statusCode = boomError?.output?.statusCode || boomError?.statusCode || 500;
+      const reason = boomError?.message || 'Unknown reason';
+      console.log(`📡 Connection closed (Status: ${statusCode}, Reason: ${reason})`);
+
+      // 440 Conflict usually means session is being used elsewhere or is corrupted
+      // 403 Forbidden can also happen if session is invalid
+      // 401 Unauthorized means logged out
+      const shouldReconnect = statusCode !== DisconnectReason.loggedOut && statusCode !== 401 && statusCode !== 440 && statusCode !== 403;
 
       if (shouldReconnect) {
-        console.log('🔄 Connection lost, reconnecting in 3s...');
-        setTimeout(() => initWhatsApp(), 3000); // Delay to prevent rapid reconnect loop
+        console.log('🔄 Connection lost, reconnecting in 5s...');
+        // Explicitly end the old socket instance
+        if (sock) {
+          try { sock.end(); } catch (e) {}
+          sock = null;
+        }
+        setTimeout(() => initWhatsApp(), 5000); 
       } else {
-        console.log('❌ Logged out. Delete auth_info/ folder and restart to re-scan.');
+        console.log('❌ Session invalid or logged out. Deleting auth_info to force fresh QR scan...');
+        try {
+          const fs = require('fs');
+          if (fs.existsSync(AUTH_DIR)) {
+             fs.rmSync(AUTH_DIR, { recursive: true, force: true });
+          }
+        } catch (e) {
+             console.error('   ⚠️ Failed to delete auth_info:', e.message);
+        }
+        console.log('🔄 Restarting WhatsApp client for new QR code in 3s...');
+        setTimeout(() => initWhatsApp(), 3000);
       }
     }
 
