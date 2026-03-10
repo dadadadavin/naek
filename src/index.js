@@ -5,7 +5,7 @@
  * Send prompts, receive responses, capture screenshots, switch models.
  *
  * Usage:
- *   1. Launch Antigravity with: antigravity . --remote-debugging-port=9222
+ *   1. Launch Antigravity with: antigravity d:\yaru --remote-debugging-port=9222
  *   2. Run: node src/index.js
  *   3. Scan the QR code with WhatsApp
  *   4. Start sending messages!
@@ -36,6 +36,11 @@ async function main() {
   console.log('  ║   Remote control your AI from your phone  ║');
   console.log('  ╚══════════════════════════════════════════╝');
   console.log('');
+  console.log(`  Config:`);
+  console.log(`    ALLOWED_PHONE: ${ALLOWED_PHONE || '(any)'}`);
+  console.log(`    CDP_PORT:      ${CDP_PORT}`);
+  console.log(`    POLL_INTERVAL: ${POLL_INTERVAL}ms`);
+  console.log('');
 
   // Step 1: Connect to WhatsApp
   console.log('📱 Initializing WhatsApp...\n');
@@ -50,7 +55,7 @@ async function main() {
 
   if (!cdpOk) {
     console.log('⚠️  Antigravity not found yet. Will retry when you send a message.');
-    console.log(`   Make sure to run: antigravity . --remote-debugging-port=${CDP_PORT}\n`);
+    console.log(`   Make sure to run: antigravity d:\\yaru --remote-debugging-port=${CDP_PORT}\n`);
   }
 
   // Step 3: Start response monitor
@@ -63,7 +68,7 @@ async function main() {
     const chunks = splitMessage(text);
     for (const chunk of chunks) {
       await sendText(activeJid, chunk);
-      if (chunks.length > 1) await sleep(500); // Small delay between chunks
+      if (chunks.length > 1) await sleep(500);
     }
   });
 
@@ -72,7 +77,6 @@ async function main() {
     if (!activeJid) return;
 
     const now = Date.now();
-    // Throttle status messages to max 1 per 5 seconds
     if (now - lastStatusTime < 5000) return;
     lastStatusTime = now;
 
@@ -81,7 +85,7 @@ async function main() {
     }
   });
 
-  // When a screenshot fallback is triggered (text extraction failed)
+  // When a screenshot fallback is triggered
   monitor.onScreenshot(async (screenshotBuffer, caption) => {
     if (!activeJid) return;
     try {
@@ -104,21 +108,19 @@ async function main() {
 
     // Track active JID for sending responses back
     activeJid = jid;
+    console.log(`📩 Message from ${jid}: "${(text || '(no text)').slice(0, 100)}"`);
 
     if (!text) {
-      // Might be an image or other media — skip for now
       await sendText(jid, '⚠️ Text messages only for now.');
       return;
     }
 
-    console.log(`📩 ${jid}: ${text.slice(0, 100)}`);
-
     // Auto-reconnect CDP if needed
     if (!cdp.isConnected()) {
       console.log('🔄 Auto-reconnecting to Antigravity...');
-      cdpOk = await cdp.reconnectCDP(CDP_PORT, 2);
+      cdpOk = await cdp.reconnectCDP(CDP_PORT, 3);
       if (!cdpOk) {
-        await sendText(jid, '❌ Antigravity not available. Start it with:\nantigravity . --remote-debugging-port=' + CDP_PORT);
+        await sendText(jid, '❌ Antigravity not available. Launch it with:\nantigravity d:\\yaru --remote-debugging-port=' + CDP_PORT);
         return;
       }
       await sendText(jid, '✅ Reconnected to Antigravity!');

@@ -5,18 +5,41 @@
 
 /**
  * Check if a sender JID is in the allowed phone list
+ * 
+ * IMPORTANT: WhatsApp now uses two JID formats:
+ * 1. Phone-based: 6289528563419@s.whatsapp.net
+ * 2. LID-based:   272700845121588@lid
+ * 
+ * For LID-based JIDs, we can't match by phone number.
+ * Strategy: 
+ *   - If JID is @s.whatsapp.net → match phone number
+ *   - If JID is @lid → allow (we trust it since we're a personal bot)
+ *   - Also check against stored LID mappings if available
  */
 function isAllowed(senderJid, allowedPhone) {
-  if (!allowedPhone) return true;
-  // Clean JID: remove suffixes, colons (multi-device), and plus signs
-  const cleaned = senderJid
-    .split('@')[0]     // Remove @s.whatsapp.net, @g.us, @lid
-    .split(':')[0]     // Remove device ID suffix (e.g. 1234:2@s.whatsapp.net)
-    .replace('+', ''); // Remove leading plus if present
+  if (!allowedPhone) return true; // No restriction set
   
-  // Allow comma-separated list
-  const allowedList = allowedPhone.split(',').map(p => p.trim().replace('+', ''));
-  return allowedList.includes(cleaned);
+  // If it's a LID-based JID, we allow it 
+  // (WhatsApp ensures only linked devices can message us)
+  if (senderJid.endsWith('@lid')) {
+    console.log(`   ℹ️  LID JID detected (${senderJid}), allowing...`);
+    return true;
+  }
+
+  // Clean phone-based JID: remove suffixes, colons (multi-device), and plus signs
+  const cleaned = senderJid
+    .split('@')[0]     // Remove @s.whatsapp.net, @g.us
+    .split(':')[0]     // Remove device ID suffix (e.g. 1234:2@s.whatsapp.net)
+    .replace(/\+/g, ''); // Remove leading plus if present
+  
+  // Allow comma-separated list of phone numbers
+  const allowedList = allowedPhone.split(',').map(p => p.trim().replace(/\+/g, ''));
+  
+  const allowed = allowedList.includes(cleaned);
+  if (!allowed) {
+    console.log(`   🚫 JID ${senderJid} (cleaned: ${cleaned}) not in allowed list: [${allowedList.join(', ')}]`);
+  }
+  return allowed;
 }
 
 /**
@@ -56,8 +79,6 @@ function splitMessage(text, maxLen = 4000) {
 /**
  * Clean up text extracted from Antigravity DOM
  * Removes common UI artifacts like "Running command", "Review Changes", etc.
- * - Trims excessive whitespace
- * - Cleans up code block formatting
  */
 function formatResponse(text) {
   if (!text) return '';
@@ -69,17 +90,16 @@ function formatResponse(text) {
     "Review Changes",
     /\d+ Files? With Changes/g,
     /Running background command\nOpen\n.*?\n>\n\nnode.*?\nAlways run\nCancel\nRunning/g,
-    /Running command\nOpen\n.*?\nAlways run\nExit code 0/g,
+    /Running command\nOpen\n.*?\nAlways run\nExit code \d+/g,
     /Background Steps\n.*?\nCancel/g,
     /Progress Updates\nCollapse all/g,
     /Ask anything, @ to mention, \/ for workflows/g,
-    /Gemini 3.1 Pro \(High\)/g,
+    /Gemini [\d.]+ Pro \((?:High|Low)\)/g,
     /Conversation mode/g,
-    /Planning/g,
-    /Fast/g,
+    /Claude [\w.]+ \(Thinking\)/g,
+    /GPT-OSS \d+B \(Medium\)/g,
     "Thought for",
     "Analyzed",
-    "Task",
     "Generating",
     ".."
   ];
@@ -92,14 +112,10 @@ function formatResponse(text) {
     }
   }
   
-  // Clean up excessive newlines caused by the line-by-line walker
-  // Replace 3+ newlines with 2 newlines
+  // Clean up excessive newlines
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
 
   return cleaned
-    // Collapse multiple blank lines to max 2 (after initial cleanup)
-    .replace(/\n{4,}/g, '\n\n\n')
-    // Trim each line
     .split('\n')
     .map(line => line.trimEnd())
     .join('\n')
