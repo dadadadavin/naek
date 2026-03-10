@@ -85,21 +85,98 @@ async function pressEscape() { await sendSpecialKey('Escape', 'Escape', 27); }
 
 // ── Core actions ──────────────────────────────────────────────
 
+/**
+ * Focus the chat input by clicking on it via the DOM.
+ * Much more reliable than keyboard shortcuts which can disrupt the UI.
+ */
 async function focusChatInput() {
-  await sendShortcut('l', 2); // Ctrl+L
-  await sleep(400);
+  if (!Runtime) throw new Error('CDP not connected');
+  
+  const r = await Runtime.evaluate({
+    expression: `(function() {
+      // Strategy 1: Find the textarea/input with "Ask anything" placeholder
+      var inputs = document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"]');
+      for (var i = 0; i < inputs.length; i++) {
+        if (inputs[i].placeholder && inputs[i].placeholder.indexOf("Ask anything") !== -1) {
+          inputs[i].focus();
+          inputs[i].click();
+          return "found-placeholder";
+        }
+      }
+      
+      // Strategy 2: Find by aria-label
+      var labeled = document.querySelector('[aria-label*="Ask anything"]');
+      if (labeled) {
+        labeled.focus();
+        labeled.click();
+        return "found-aria";
+      }
+      
+      // Strategy 3: Find the element containing "Ask anything" and click near it
+      var allEls = document.querySelectorAll('*');
+      for (var j = 0; j < allEls.length; j++) {
+        var el = allEls[j];
+        if (el.children.length === 0 && el.textContent.indexOf("Ask anything") !== -1) {
+          // Found the placeholder text — the input is likely the parent or sibling
+          var parent = el.parentElement;
+          if (parent) {
+            var input = parent.querySelector('textarea, [contenteditable="true"], input');
+            if (input) { input.focus(); input.click(); return "found-near-placeholder"; }
+            // Try the parent itself
+            parent.focus();
+            parent.click();
+            return "found-parent";
+          }
+        }
+      }
+      
+      // Strategy 4: Find any visible textarea
+      var textareas = document.querySelectorAll('textarea');
+      for (var k = 0; k < textareas.length; k++) {
+        if (textareas[k].offsetParent !== null) {
+          textareas[k].focus();
+          textareas[k].click();
+          return "found-visible-textarea";
+        }
+      }
+      
+      return "not-found";
+    })()`,
+    returnByValue: true,
+  });
+  
+  const result = r.result?.value || 'error';
+  if (result === 'not-found') {
+    console.log('  ⚠ Chat input not found via DOM, falling back to keyboard');
+    // Last resort: try Ctrl+I or another shortcut specific to Antigravity
+    await sendShortcut('i', 2); // Ctrl+I might focus input in some versions
+    await sleep(300);
+  }
+  await sleep(300);
 }
 
 /**
- * Inject a prompt into Antigravity's chat
+ * Inject a prompt into Antigravity's chat.
+ * Uses DOM focus (not Ctrl+L) to avoid disrupting the UI.
  */
 async function injectPrompt(text) {
   if (!Input) throw new Error('CDP not connected');
+  
+  // Step 1: Focus the chat input via DOM
   await focusChatInput();
-  await sendShortcut('a', 2); // Select all
-  await sleep(100);
+  
+  // Step 2: Clear any existing text in the input
+  // Use Home + Shift+End to select, then overwrite, instead of Ctrl+A which selects ALL
+  await sendSpecialKey('Home', 'Home', 36); // Move to start
+  await sleep(50);
+  await sendSpecialKey('End', 'End', 35, 1); // Shift+End = select to end
+  await sleep(50);
+  
+  // Step 3: Type the prompt (replaces selection)
   await typeText(text);
   await sleep(200);
+  
+  // Step 4: Submit
   await pressEnter();
   return true;
 }
