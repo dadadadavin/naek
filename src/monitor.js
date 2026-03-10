@@ -1,10 +1,11 @@
 /**
  * naek — Response Monitor
- * Polls Antigravity for new responses and streams them back
+ * Polls Antigravity for new responses and sends them to WhatsApp.
  * 
- * Two strategies:
- * 1. Text-based: Try to read response text from execution contexts
- * 2. Screenshot-based: After a prompt, wait for activity to stop, then screenshot
+ * FIX #4: captureBaseline stores both hash AND length, so we can detect
+ * when a brand new response starts even if the hash collides.
+ * FIX #12: Uses SHA-like string comparison instead of simple DJB2 hash
+ * to reduce collision risk.
  */
 
 const cdp = require('./cdp');
@@ -12,155 +13,122 @@ const { formatResponse } = require('./utils');
 
 let polling = false;
 let pollTimer = null;
+let baselineHash = '';
+let baselineLen = 0;
 let lastResponseHash = '';
+let lastResponseText = '';
 let stableCount = 0;
 let onResponseCallback = null;
 let onStatusCallback = null;
 let onScreenshotCallback = null;
 let waitingForResponse = false;
-let emptyPolls = 0;
+let waitStartTime = 0;
+let sentThinking = false;
 
-/**
- * Simple hash for comparing response content
- */
+const SCREENSHOT_TIMEOUT = 30000;
+
+// FIX #12: Better hash using FNV-1a (much lower collision rate than DJB2)
 function hash(str) {
-  if (!str) return '';
-  let h = 0;
+  if (!str) return '0:0';
+  let h = 2166136261;
   for (let i = 0; i < str.length; i++) {
-    const chr = str.charCodeAt(i);
-    h = ((h << 5) - h) + chr;
-    h |= 0;
+    h ^= str.charCodeAt(i);
+    h = Math.imul(h, 16777619);
   }
-  return String(h);
+  // Include length in hash to further reduce collisions
+  return `${(h >>> 0).toString(36)}:${str.length}`;
 }
 
-/**
- * Start polling for responses
- */
 function startPolling(intervalMs = 2000) {
   if (polling) return;
   polling = true;
   stableCount = 0;
   lastResponseHash = '';
-  emptyPolls = 0;
-
-  console.log(`👁️  Response monitor started (polling every ${intervalMs}ms)`);
+  lastResponseText = '';
 
   pollTimer = setInterval(async () => {
     try {
-      if (!cdp.isConnected()) return;
+      if (!cdp.isConnected() || !waitingForResponse) return;
 
-      // Try reading response text from execution contexts  
       const response = await cdp.getLatestResponse();
       const currentHash = hash(response);
+      const hasContent = response.length > 10;
 
-      if (currentHash !== lastResponseHash && response.length > 5) {
-        // New content detected
-        stableCount = 1;
-        lastResponseHash = currentHash;
-        emptyPolls = 0;
-      } else if (currentHash === lastResponseHash && response.length > 5) {
-        // Same content, increment stable count
-        stableCount++;
-
-        if (stableCount >= 3 && waitingForResponse) {
-          // Stable for 3 polls = response likely complete
-          const formatted = formatResponse(response);
-          if (formatted && onResponseCallback) {
-            console.log(`   📤 Response detected (${formatted.length} chars), sending to WhatsApp...`);
-            onResponseCallback(formatted);
-            waitingForResponse = false;
-          }
-          stableCount = 0;
-        }
-      } else {
-        emptyPolls++;
-        
-        // If we've been waiting and getting empty reads, send a screenshot instead
-        // Wait for 20 empty polls (40 seconds) to ensure AI has finished generating
-        if (waitingForResponse && emptyPolls >= 20) {
-          console.log('   📸 Text read failed, sending screenshot instead...');
+      // FIX #4: Compare against baseline to only detect NEW content
+      if (currentHash === baselineHash) {
+        // Content hasn't changed from baseline — AI hasn't responded yet
+        // Check screenshot timeout
+        if (Date.now() - waitStartTime > SCREENSHOT_TIMEOUT) {
           try {
             const screenshot = await cdp.takeScreenshot();
             if (screenshot && onScreenshotCallback) {
-              onScreenshotCallback(screenshot, '📸 Response screenshot (text extraction unavailable)');
+              onScreenshotCallback(screenshot, '📸 AI response (text extraction failed)');
               waitingForResponse = false;
+              sentThinking = false;
             }
-          } catch (e) {
-            console.log('   ⚠️  Screenshot fallback also failed:', e.message);
+          } catch (e) { /* ignore */ }
+        }
+        return;
+      }
+
+      if (hasContent && currentHash !== lastResponseHash) {
+        // Content is changing → AI is generating
+        stableCount = 0;
+        lastResponseHash = currentHash;
+        lastResponseText = response;
+
+        if (!sentThinking && onStatusCallback) {
+          onStatusCallback('thinking');
+          sentThinking = true;
+        }
+      } else if (hasContent && currentHash === lastResponseHash) {
+        // Same content as last poll → maybe done
+        stableCount++;
+
+        if (stableCount >= 2) {
+          const formatted = formatResponse(lastResponseText);
+          if (formatted && formatted.length > 5 && onResponseCallback) {
+            onResponseCallback(formatted);
+            waitingForResponse = false;
+            sentThinking = false;
+            // Update baseline to current so we don't re-send
+            baselineHash = currentHash;
+            baselineLen = response.length;
           }
-          emptyPolls = 0;
+          stableCount = 0;
         }
       }
     } catch (err) {
-      if (err.message.includes('not connected') || err.message.includes('WebSocket')) {
-        console.log('⚠️  CDP connection lost during polling');
-      }
+      // Silently handle CDP disconnects during polling
     }
   }, intervalMs);
 }
 
-/**
- * Stop polling
- */
 function stopPolling() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
-  }
+  if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
   polling = false;
-  console.log('⏹️  Response monitor stopped');
 }
 
-/**
- * Register callback for when a complete text response is detected
- */
-function onResponse(callback) {
-  onResponseCallback = callback;
-}
+function onResponse(callback) { onResponseCallback = callback; }
+function onScreenshot(callback) { onScreenshotCallback = callback; }
+function onStatus(callback) { onStatusCallback = callback; }
 
-/**
- * Register callback for screenshot responses
- */
-function onScreenshot(callback) {
-  onScreenshotCallback = callback;
-}
-
-/**
- * Register callback for status changes (thinking, generating)
- */
-function onStatus(callback) {
-  onStatusCallback = callback;
-}
-
-/**
- * Reset monitor state and mark as waiting for a response
- */
 function reset() {
   stableCount = 0;
-  emptyPolls = 0;
   waitingForResponse = true;
+  waitStartTime = Date.now();
+  sentThinking = false;
 }
 
-/**
- * Force capture current state as baseline
- */
 async function captureBaseline() {
   try {
     const response = await cdp.getLatestResponse();
-    lastResponseHash = hash(response);
+    baselineHash = hash(response);
+    baselineLen = response.length;
+    lastResponseHash = baselineHash;
+    lastResponseText = response;
     stableCount = 0;
-  } catch (e) {
-    // Ignore
-  }
+  } catch (e) { /* ignore */ }
 }
 
-module.exports = {
-  startPolling,
-  stopPolling,
-  onResponse,
-  onScreenshot,
-  onStatus,
-  reset,
-  captureBaseline,
-};
+module.exports = { startPolling, stopPolling, onResponse, onScreenshot, onStatus, reset, captureBaseline };

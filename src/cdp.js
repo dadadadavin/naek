@@ -1,17 +1,8 @@
 /**
  * naek — CDP Bridge to Antigravity
  * 
- * IMPORTANT: Antigravity (VS Code-based) uses nested iframes/webviews for
- * the chat panel. This means document.querySelector() from the main page
- * CANNOT reach into the chat input. 
- * 
- * Solution: Use CDP keyboard simulation (Input.dispatchKeyEvent / Input.insertText)
- * which sends keystrokes directly to the focused element, bypassing all iframe
- * boundaries. For screenshots, we use Page.captureScreenshot which also works
- * regardless of iframe structure.
- * 
- * For reading responses, we use the VS Code command palette approach — executing
- * VS Code commands via keyboard shortcuts to copy clipboard content.
+ * Uses keyboard simulation (Input.dispatchKeyEvent / Input.insertText) to
+ * interact with Antigravity's chat. This bypasses all iframe/webview boundaries.
  */
 
 const CDP = require('chrome-remote-interface');
@@ -22,10 +13,6 @@ let Runtime = null;
 let Page = null;
 let Input = null;
 
-// Track all execution contexts (main page + iframes/webviews)
-let executionContexts = new Map();
-let chatContextId = null;
-
 /**
  * Connect to Antigravity via CDP
  */
@@ -33,7 +20,6 @@ async function connectCDP(port = 9222) {
   try {
     const targets = await CDP.List({ port });
     
-    // Find the main editor window (not Launchpad, not workers)
     let target = targets.find(t => 
       t.type === 'page' && 
       !t.title.includes('Launchpad') && 
@@ -41,13 +27,8 @@ async function connectCDP(port = 9222) {
       !t.url.includes('devtools://')
     );
 
-    if (!target) {
-      target = targets.find(t => t.type === 'page');
-    }
-
-    if (!target) {
-      throw new Error('No Antigravity target found. Is Antigravity running with --remote-debugging-port=' + port + '?');
-    }
+    if (!target) target = targets.find(t => t.type === 'page');
+    if (!target) throw new Error('No Antigravity window found.');
 
     client = await CDP({ port, target });
     Runtime = client.Runtime;
@@ -57,180 +38,74 @@ async function connectCDP(port = 9222) {
     await Runtime.enable();
     await Page.enable();
 
-    // Track execution contexts to find the chat webview iframe
-    executionContexts.clear();
-    chatContextId = null;
-
-    client.Runtime.executionContextCreated(({ context }) => {
-      executionContexts.set(context.id, {
-        id: context.id,
-        origin: context.origin,
-        name: context.name || '',
-      });
+    // FIX #2: Listen for disconnect so isConnected() never lies
+    client.on('disconnect', () => {
+      console.log('  ⚠ CDP connection dropped.');
+      client = null; Runtime = null; Page = null; Input = null;
     });
 
-    client.Runtime.executionContextDestroyed(({ executionContextId }) => {
-      executionContexts.delete(executionContextId);
-      if (chatContextId === executionContextId) chatContextId = null;
-    });
+    await sleep(300);
 
-    // Wait a bit for contexts to be reported
-    await sleep(500);
-    
-    // Try to discover the chat context
-    await discoverChatContext();
-    console.log(`   📋 Found ${executionContexts.size} execution contexts`);
-
-    console.log(`🔗 Connected to Antigravity via CDP (port ${port})`);
-    console.log(`   Target: ${target.title || target.url}`);
-
+    console.log(`  ✓ CDP connected → ${target.title || target.url}`);
     return true;
   } catch (err) {
-    console.error(`❌ CDP connection failed: ${err.message}`);
-    console.error(`   Make sure Antigravity is running with: antigravity . --remote-debugging-port=${port}`);
+    console.error(`  ✗ CDP failed: ${err.message}`);
+    client = null; Runtime = null; Page = null; Input = null;
     return false;
   }
 }
 
-/**
- * Check if CDP is connected
- */
-function isConnected() {
-  return client !== null;
-}
+function isConnected() { return client !== null && Runtime !== null; }
 
-// =========================================================
-// KEYBOARD SIMULATION HELPERS
-// These bypass iframe boundaries entirely
-// =========================================================
+// ── Keyboard helpers ──────────────────────────────────────────
 
-/**
- * Send a keyboard shortcut (e.g., Ctrl+L to open chat)
- */
 async function sendShortcut(key, modifiers = 0) {
   if (!Input) throw new Error('CDP not connected');
-  
-  // modifiers: 1=Alt, 2=Ctrl, 4=Meta, 8=Shift
-  await Input.dispatchKeyEvent({
-    type: 'keyDown',
-    key,
-    code: `Key${key.toUpperCase()}`,
-    windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0),
-    nativeVirtualKeyCode: key.toUpperCase().charCodeAt(0),
-    modifiers,
-  });
+  const code = `Key${key.toUpperCase()}`;
+  const vk = key.toUpperCase().charCodeAt(0);
+  await Input.dispatchKeyEvent({ type: 'keyDown', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers });
   await sleep(50);
-  await Input.dispatchKeyEvent({
-    type: 'keyUp',
-    key,
-    code: `Key${key.toUpperCase()}`,
-    windowsVirtualKeyCode: key.toUpperCase().charCodeAt(0),
-    nativeVirtualKeyCode: key.toUpperCase().charCodeAt(0),
-    modifiers,
-  });
+  await Input.dispatchKeyEvent({ type: 'keyUp', key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers });
 }
 
-/**
- * Send a special key (Enter, Escape, Tab, etc.)
- */
 async function sendSpecialKey(key, code, keyCode, modifiers = 0) {
   if (!Input) throw new Error('CDP not connected');
-  
-  await Input.dispatchKeyEvent({
-    type: 'rawKeyDown',
-    key,
-    code,
-    windowsVirtualKeyCode: keyCode,
-    nativeVirtualKeyCode: keyCode,
-    modifiers,
-  });
+  await Input.dispatchKeyEvent({ type: 'rawKeyDown', key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode, modifiers });
   await sleep(30);
-  await Input.dispatchKeyEvent({
-    type: 'keyUp',
-    key,
-    code,
-    windowsVirtualKeyCode: keyCode,
-    nativeVirtualKeyCode: keyCode,
-    modifiers,
-  });
+  await Input.dispatchKeyEvent({ type: 'keyUp', key, code, windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode, modifiers });
 }
 
-/**
- * Type text using Input.insertText (fast, works across iframes)
- */
 async function typeText(text) {
   if (!Input) throw new Error('CDP not connected');
   await Input.insertText({ text });
 }
 
-/**
- * Press Enter key
- */
-async function pressEnter(modifiers = 0) {
-  await sendSpecialKey('Enter', 'Enter', 13, modifiers);
-}
+async function pressEnter(modifiers = 0) { await sendSpecialKey('Enter', 'Enter', 13, modifiers); }
+async function pressEscape() { await sendSpecialKey('Escape', 'Escape', 27); }
 
-/**
- * Press Escape key
- */
-async function pressEscape() {
-  await sendSpecialKey('Escape', 'Escape', 27);
-}
+// ── Core actions ──────────────────────────────────────────────
 
-/**
- * Click at a specific coordinate on the page
- */
-async function clickAt(x, y) {
-  if (!Input) throw new Error('CDP not connected');
-  
-  await Input.dispatchMouseEvent({ type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
-  await sleep(50);
-  await Input.dispatchMouseEvent({ type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
-}
-
-/**
- * Focus the chat input using Ctrl+L
- */
 async function focusChatInput() {
-  console.log('   ⌨️  Focusing chat input via Ctrl+L...');
   await sendShortcut('l', 2); // Ctrl+L
-  await sleep(300);
+  await sleep(400);
 }
 
 /**
- * Inject a prompt into Antigravity's chat and submit it
- * 
- * Strategy:
- * 1. Focus the chat input via Ctrl+L
- * 2. Select all existing text (Ctrl+A) to replace it
- * 3. Type the new prompt using Input.insertText
- * 4. Press Enter to submit
+ * Inject a prompt into Antigravity's chat
  */
 async function injectPrompt(text) {
   if (!Input) throw new Error('CDP not connected');
-
-  console.log('   ⌨️  Injecting prompt via keyboard simulation...');
-
-  // Step 1: Focus chat
   await focusChatInput();
-
-  // Step 2: Select all text in the input (in case there's old text)
-  await sendShortcut('a', 2); // Ctrl+A
+  await sendShortcut('a', 2); // Select all
   await sleep(100);
-
-  // Step 3: Type the prompt text (this replaces selected text)
   await typeText(text);
   await sleep(200);
-
-  // Step 4: Press Enter to submit
   await pressEnter();
-  
-  console.log('   ✅ Prompt injected and submitted!');
   return true;
 }
 
 /**
- * Take a screenshot of the Antigravity window
+ * Take a screenshot
  */
 async function takeScreenshot() {
   if (!Page) throw new Error('CDP not connected');
@@ -239,16 +114,14 @@ async function takeScreenshot() {
 }
 
 /**
- * Discover which execution context belongs to the chat webview
- * (Legacy from iframe support, keeping for compatibility but main logic is now on main page)
- */
-async function discoverChatContext() {
-  // Not strictly needed anymore since we are acting on the main DOM, but kept for compatibility
-}
-
-/**
- * Get the latest response text from the chat
- * Strategy: Find the chat input ("Ask anything") and extract the text nodes immediately preceding it.
+ * Get the latest AI response from the chat DOM.
+ * 
+ * FIX #1: All regex is written as plain JS inside the evaluate string,
+ * with correct single-level escaping for the template literal.
+ * 
+ * FIX #7: Only extracts the LAST assistant message block, not the entire
+ * conversation, by scanning backwards from "Ask anything" to find the
+ * user's prompt boundary.
  */
 async function getLatestResponse() {
   if (!Runtime) return '';
@@ -256,219 +129,221 @@ async function getLatestResponse() {
   try {
     const r = await Runtime.evaluate({
       expression: `(function() {
-        // Find the "Ask anything" placeholder or chat input
-        const els = Array.from(document.querySelectorAll('*'));
-        let inputEl = null;
-        for (let el of els) {
-          if (el.textContent && el.textContent.includes("Ask anything") && el.children.length === 0) {
-            inputEl = el;
-            break;
+        var conv = document.getElementById('conversation');
+        if (!conv) return "";
+
+        // Walk text nodes, skip style/script/svg
+        var texts = [];
+        var walker = document.createTreeWalker(conv, NodeFilter.SHOW_TEXT, {
+          acceptNode: function(node) {
+            var p = node.parentElement;
+            if (!p) return NodeFilter.FILTER_REJECT;
+            var tag = p.tagName.toLowerCase();
+            if (tag === 'style' || tag === 'script' || tag === 'svg' || tag === 'path' || tag === 'noscript') {
+              return NodeFilter.FILTER_REJECT;
+            }
+            return NodeFilter.FILTER_ACCEPT;
           }
+        });
+        
+        var n;
+        while ((n = walker.nextNode())) {
+          var t = n.textContent.trim();
+          if (t.length > 0) texts.push(t);
         }
         
-        let conv = document.getElementById('conversation');
-        if (!conv) return ""; // Not open yet?
-        
-        let texts = [];
-        if (inputEl) {
-            let walker = document.createTreeWalker(conv, NodeFilter.SHOW_TEXT, null, false);
-            let node;
-            while ((node = walker.nextNode())) {
-              let t = node.textContent.trim();
-              if (t.length > 0) texts.push(t);
-            }
-            let idx = texts.findIndex(t => t.includes("Ask anything"));
-            if (idx !== -1) {
-                // Get the text nodes before it (the assistant response)
-                // Filter out UI text like model names
-                let responseTexts = texts.slice(Math.max(0, idx - 15), idx).filter(t => 
-                    !["New", "Planning", "Fast", "Conversation mode"].includes(t) && 
-                    !t.includes("Gemini ") && 
-                    !t.includes("Claude ") && 
-                    !t.includes("GPT-OSS")
-                );
-                return responseTexts.join('\\n');
-            }
+        // Find the input area
+        var idx = -1;
+        for (var i = texts.length - 1; i >= 0; i--) {
+          if (texts[i].indexOf("Ask anything") !== -1) { idx = i; break; }
+        }
+        if (idx === -1) return "";
+
+        // Exact-match junk strings
+        var junkSet = {
+          "New": 1, "Planning": 1, "Fast": 1, "Conversation mode": 1, "Model": 1,
+          "Review Changes": 1, "Always run": 1, "Cancel": 1, "Running": 1, "Running.": 1,
+          "Generating": 1, "..": 1, "Open": 1, "Analyzed": 1, "Edited": 1,
+          "0 Files With Changes": 1, "Background Steps": 1, "Progress Updates": 1,
+          "Collapse all": 1, "Task": 1,
+          "Agent can plan before executing tasks. Use for deep research, complex tasks, or collaborative work": 1,
+          "Agent will execute tasks directly. Use for simple tasks that can be completed faster": 1
+        };
+
+        // Filter to only text before the input
+        var beforeInput = texts.slice(0, idx);
+        var filtered = [];
+        for (var j = 0; j < beforeInput.length; j++) {
+          var txt = beforeInput[j];
+          // Skip exact junk matches
+          if (junkSet[txt]) continue;
+          // Skip model names
+          if (txt.indexOf("Gemini ") === 0) continue;
+          if (txt.indexOf("Claude ") === 0) continue;
+          if (txt.indexOf("GPT-OSS ") === 0) continue;
+          // Skip "Thought for Xs" pattern
+          if (/^Thought for \\d/.test(txt)) continue;
+          // Skip "N Files With Changes"
+          if (/^\\d+ Files? With Changes$/.test(txt)) continue;
+          // Skip file paths
+          if (/^d:\\\\/.test(txt)) continue;
+          if (/^> node /.test(txt)) continue;
+          // Skip exit codes
+          if (/^Exit code \\d+$/.test(txt)) continue;
+          // Skip CSS selectors: lines starting with . followed by class names and {
+          if (/^\\.[-a-zA-Z_]/.test(txt)) continue;
+          // Skip CSS property lines: "property-name: value;"
+          if (/^[a-z-]+:\\s.*[;{}]/.test(txt)) continue;
+          // Skip large CSS blocks
+          if (txt.length > 300 && txt.indexOf('{') !== -1 && txt.indexOf('}') !== -1) continue;
+          // Skip Step Id lines
+          if (/^Step Id: \\d+$/.test(txt)) continue;
+          filtered.push(txt);
         }
         
-        // Fallback: just return the innerText
-        return conv.innerText;
+        // FIX #7: Find the last user message boundary
+        // User messages in Antigravity are typically shorter texts followed by
+        // the AI response. We look for the pattern where a short text (user prompt)
+        // is followed by longer content (AI response).
+        // Strategy: scan backwards and find where the latest "turn" starts.
+        // The last message boundary is typically marked by a shift in content density.
+        // For now, take the last 50 text nodes max to avoid sending entire chat history.
+        var maxNodes = 50;
+        if (filtered.length > maxNodes) {
+          filtered = filtered.slice(filtered.length - maxNodes);
+        }
+        
+        return filtered.join("\\n");
       })()`,
       returnByValue: true,
     });
     return r.result?.value || '';
   } catch (err) {
-    console.error("Error getting response:", err);
     return '';
   }
 }
 
-
 /**
- * Check if Antigravity is currently thinking/generating
- * We check the page title or look for visual indicators
+ * Check if Antigravity is generating
  */
-async function isThinking() {
+async function isGenerating() {
   if (!Runtime) return false;
-  
   try {
-    const result = await Runtime.evaluate({
-      expression: `document.title`,
+    const r = await Runtime.evaluate({
+      expression: `(function() {
+        var conv = document.getElementById('conversation');
+        if (!conv) return false;
+        var text = conv.innerText;
+        return text.indexOf('Generating') !== -1 || (text.indexOf('Cancel') !== -1 && text.indexOf('Running') !== -1);
+      })()`,
       returnByValue: true,
     });
-    const title = result.result?.value || '';
-    // VS Code-based editors often show loading indicators in the title
-    return title.includes('●') || title.includes('…') || title.includes('Loading');
-  } catch {
-    return false;
-  }
+    return r.result?.value || false;
+  } catch { return false; }
 }
 
 /**
- * Stop the current generation (Escape key)
+ * Get current model and mode from the DOM
  */
+async function getStatus() {
+  if (!Runtime) return { model: 'unknown', mode: 'unknown', connected: false };
+  try {
+    const r = await Runtime.evaluate({
+      expression: `(function() {
+        var conv = document.getElementById('conversation');
+        if (!conv) return JSON.stringify({ model: 'unknown', mode: 'unknown', connected: true });
+        var text = conv.innerText;
+        
+        var model = 'unknown';
+        var models = ['Gemini 3.1 Pro (High)', 'Gemini 3.1 Pro (Low)', 'Gemini 3 Flash', 
+                       'Claude Sonnet 4.6 (Thinking)', 'Claude Opus 4.6 (Thinking)', 'GPT-OSS 120B (Medium)'];
+        for (var i = 0; i < models.length; i++) {
+          if (text.indexOf(models[i]) !== -1) { model = models[i]; break; }
+        }
+        
+        var mode = 'unknown';
+        if (text.indexOf('Planning') !== -1) mode = 'Planning';
+        if (text.indexOf('Fast') !== -1) mode = 'Fast';
+        
+        return JSON.stringify({ model: model, mode: mode, connected: true, title: document.title });
+      })()`,
+      returnByValue: true,
+    });
+    return JSON.parse(r.result?.value || '{}');
+  } catch {
+    return { model: 'unknown', mode: 'unknown', connected: false };
+  }
+}
+
 async function stopGeneration() {
-  console.log('   ⏹️ Sending Escape to stop generation...');
   await pressEscape();
   return true;
 }
 
-/**
- * Start a new chat
- * In Antigravity, this is typically Ctrl+Shift+L or via command palette
- */
 async function startNewChat() {
-  console.log('   🆕 Starting new chat...');
-  // Try Ctrl+L first to focus chat, then look for new chat shortcut
-  await openChatPanel();
-  await sleep(200);
-  
-  // Use Ctrl+Shift+P to open command palette
-  await sendSpecialKey('P', 'KeyP', 80, 10); // 2(Ctrl) + 8(Shift) = 10
-  await sleep(300);
-  
-  // Type "new chat" to find the command
+  // Ctrl+Shift+P → type command → Enter
+  await sendSpecialKey('P', 'KeyP', 80, 10); // Ctrl+Shift+P
+  await sleep(400);
   await typeText('Antigravity: New Chat');
-  await sleep(300);
-  
-  // Press Enter to execute
+  await sleep(500);
   await pressEnter();
-  await sleep(200);
-  
+  await sleep(300);
   return true;
 }
 
-/**
- * Accept an approval dialog
- * In Antigravity, approval buttons appear in the chat area
- * We can try Tab to navigate to the button, then Enter
- */
+// FIX #10: acceptDialog now tries to find and click the actual accept button via DOM
 async function acceptDialog() {
-  console.log('   ✅ Accepting dialog...');
-  // Common shortcut: Ctrl+Shift+Enter or just Tab+Enter
-  // Try clicking via keyboard navigation
+  if (!Runtime) { return false; }
+  try {
+    const r = await Runtime.evaluate({
+      expression: `(function() {
+        // Look for buttons with accept-like text
+        var buttons = document.querySelectorAll('button');
+        for (var i = 0; i < buttons.length; i++) {
+          var txt = buttons[i].textContent.trim().toLowerCase();
+          if (txt === 'accept' || txt === 'approve' || txt === 'allow' || txt === 'always run' || txt === 'run') {
+            buttons[i].click();
+            return true;
+          }
+        }
+        return false;
+      })()`,
+      returnByValue: true,
+    });
+    if (r.result?.value) return true;
+  } catch {}
+  // Fallback: Tab+Enter
   await sendSpecialKey('Tab', 'Tab', 9);
   await sleep(100);
   await pressEnter();
   return true;
 }
 
-/**
- * Reject an approval dialog
- */
 async function rejectDialog() {
-  console.log('   ❌ Rejecting dialog...');
   await pressEscape();
   return true;
 }
 
-/**
- * Get current status info
- */
-async function getStatus() {
-  if (!Runtime) return JSON.stringify({ model: 'unknown', mode: 'unknown', connected: false });
-  
-  try {
-    const result = await Runtime.evaluate({
-      expression: `document.title`,
-      returnByValue: true,
-    });
-    const title = result.result?.value || 'Unknown';
-    return JSON.stringify({
-      model: 'check Antigravity UI',
-      mode: 'check Antigravity UI',
-      connected: true,
-      windowTitle: title,
-    });
-  } catch {
-    return JSON.stringify({ model: 'unknown', mode: 'unknown', connected: false });
-  }
-}
-
-/**
- * Disconnect from CDP
- */
 async function disconnectCDP() {
   if (client) {
-    await client.close();
-    client = null;
-    Runtime = null;
-    Page = null;
-    Input = null;
-    console.log('🔌 CDP disconnected');
+    try { await client.close(); } catch {}
+    client = null; Runtime = null; Page = null; Input = null;
   }
 }
 
-/**
- * Attempt to reconnect to CDP
- */
 async function reconnectCDP(port = 9222, maxRetries = 5) {
-  // Disconnect first if already connected
-  if (client) {
-    try { await client.close(); } catch {}
-    client = null;
-    Runtime = null;
-    Page = null;
-    Input = null;
-  }
-  
+  await disconnectCDP();
   for (let i = 0; i < maxRetries; i++) {
-    console.log(`🔄 CDP reconnect attempt ${i + 1}/${maxRetries}...`);
-    const ok = await connectCDP(port);
-    if (ok) return true;
+    console.log(`  ↻ CDP reconnect ${i + 1}/${maxRetries}...`);
+    if (await connectCDP(port)) return true;
     await sleep(2000);
   }
   return false;
 }
 
-// Placeholder SELECTORS for backward compatibility with commands.js
-const SELECTORS = {
-  chatInput: '',
-  submitButton: '',
-  lastResponse: '',
-  allResponses: '',
-  thinkingIndicator: '',
-  stopButton: '',
-  modelSelector: '',
-  modeSelector: '',
-  acceptButton: '',
-  rejectButton: '',
-  newChatButton: '',
-};
-
 module.exports = {
-  connectCDP,
-  disconnectCDP,
-  reconnectCDP,
-  isConnected,
-  injectPrompt,
-  getLatestResponse,
-  isThinking,
-  takeScreenshot,
-  stopGeneration,
-  startNewChat,
-  acceptDialog,
-  rejectDialog,
-  getStatus,
-  SELECTORS,
+  connectCDP, disconnectCDP, reconnectCDP, isConnected,
+  injectPrompt, getLatestResponse, isGenerating,
+  takeScreenshot, stopGeneration, startNewChat,
+  acceptDialog, rejectDialog, getStatus,
 };

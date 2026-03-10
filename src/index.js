@@ -1,14 +1,13 @@
 /**
  * naek — WhatsApp Remote Control for Antigravity
  *
- * Control your Antigravity IDE from WhatsApp.
- * Send prompts, receive responses, capture screenshots, switch models.
- *
  * Usage:
- *   1. Launch Antigravity with: antigravity d:\yaru --remote-debugging-port=9222
- *   2. Run: node src/index.js
- *   3. Scan the QR code with WhatsApp
- *   4. Start sending messages!
+ *   1. antigravity d:\yaru --remote-debugging-port=9222
+ *   2. node src/index.js  (or: npm start)
+ *   3. Scan QR with WhatsApp
+ *   4. Send messages!
+ * 
+ * FIX #13: Startup waits for WhatsApp 'open' event instead of arbitrary sleep.
  */
 
 require('dotenv').config();
@@ -19,52 +18,53 @@ const monitor = require('./monitor');
 const { handleMessage } = require('./commands');
 const { isAllowed, splitMessage, sleep } = require('./utils');
 
-// Config
 const ALLOWED_PHONE = process.env.ALLOWED_PHONE || '';
 const CDP_PORT = parseInt(process.env.CDP_PORT || '9222');
 const POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '2000');
 
-// Active chat JID (so monitor can send responses back)
 let activeJid = null;
-// Throttle status messages
-let lastStatusTime = 0;
 
 async function main() {
   console.log('');
-  console.log('  ╔══════════════════════════════════════════╗');
-  console.log('  ║   naek — WhatsApp × Antigravity          ║');
-  console.log('  ║   Remote control your AI from your phone  ║');
-  console.log('  ╚══════════════════════════════════════════╝');
+  console.log('  ┌──────────────────────────────────────┐');
+  console.log('  │  naek — WhatsApp × Antigravity       │');
+  console.log('  │  Remote control AI from your phone   │');
+  console.log('  └──────────────────────────────────────┘');
   console.log('');
-  console.log(`  Config:`);
-  console.log(`    ALLOWED_PHONE: ${ALLOWED_PHONE || '(any)'}`);
-  console.log(`    CDP_PORT:      ${CDP_PORT}`);
-  console.log(`    POLL_INTERVAL: ${POLL_INTERVAL}ms`);
+  console.log(`  Phone: ${ALLOWED_PHONE || '(any)'} | CDP: ${CDP_PORT} | Poll: ${POLL_INTERVAL}ms`);
   console.log('');
 
-  // Step 1: Connect to WhatsApp
-  console.log('📱 Initializing WhatsApp...\n');
+  // 1. WhatsApp — initWhatsApp is async but the QR/connect happens via events
+  console.log('  [1/3] WhatsApp...');
   await initWhatsApp();
 
-  // Wait a moment for WhatsApp to connect
-  await sleep(2000);
-
-  // Step 2: Connect to Antigravity via CDP
-  console.log('\n🔗 Connecting to Antigravity...');
-  let cdpOk = await cdp.connectCDP(CDP_PORT);
-
-  if (!cdpOk) {
-    console.log('⚠️  Antigravity not found yet. Will retry when you send a message.');
-    console.log(`   Make sure to run: antigravity d:\\yaru --remote-debugging-port=${CDP_PORT}\n`);
+  // FIX #13: Wait up to 15s for WhatsApp to connect, but don't block forever
+  const waConnected = await waitForCondition(
+    () => {
+      // Check if sock exists and has connected by trying getSocket
+      const { getSocket } = require('./whatsapp');
+      return getSocket() !== null;
+    },
+    15000, 500
+  );
+  if (!waConnected) {
+    console.log('  ⚠ WhatsApp not connected yet. QR scan may be needed.');
   }
 
-  // Step 3: Start response monitor
+  // 2. CDP
+  console.log('  [2/3] Antigravity CDP...');
+  let cdpOk = await cdp.connectCDP(CDP_PORT);
+  if (!cdpOk) {
+    console.log('  ⚠ Antigravity not found. Will auto-connect when you message.');
+    console.log(`    Run: antigravity d:\\yaru --remote-debugging-port=${CDP_PORT}`);
+  }
+
+  // 3. Monitor
+  console.log('  [3/3] Response monitor...');
   monitor.startPolling(POLL_INTERVAL);
 
-  // When a complete response is detected, send it to WhatsApp
   monitor.onResponse(async (text) => {
     if (!activeJid) return;
-
     const chunks = splitMessage(text);
     for (const chunk of chunks) {
       await sendText(activeJid, chunk);
@@ -72,83 +72,72 @@ async function main() {
     }
   });
 
-  // When thinking/generating status changes
   monitor.onStatus(async (status) => {
     if (!activeJid) return;
-
-    const now = Date.now();
-    if (now - lastStatusTime < 5000) return;
-    lastStatusTime = now;
-
     if (status === 'thinking') {
-      await sendText(activeJid, '🤔 Thinking...');
+      await sendText(activeJid, '🤔 _Thinking..._');
     }
   });
 
-  // When a screenshot fallback is triggered
-  monitor.onScreenshot(async (screenshotBuffer, caption) => {
+  monitor.onScreenshot(async (buf, caption) => {
     if (!activeJid) return;
-    try {
-      await sendImage(activeJid, screenshotBuffer, caption);
-    } catch (err) {
-      console.log('   ⚠️  Failed to send screenshot:', err.message);
-    }
+    try { await sendImage(activeJid, buf, caption); } catch {}
   });
 
-  // Step 4: Handle incoming WhatsApp messages
+  // 4. Message handler
   onMessage(async (msg) => {
     const jid = getSenderJid(msg);
     const text = getMessageText(msg);
 
-    // Security: only respond to allowed phone
-    if (ALLOWED_PHONE && !isAllowed(jid, ALLOWED_PHONE)) {
-      console.log(`🚫 Blocked message from unauthorized: ${jid}`);
-      return;
-    }
+    if (ALLOWED_PHONE && !isAllowed(jid, ALLOWED_PHONE)) return;
 
-    // Track active JID for sending responses back
     activeJid = jid;
-    console.log(`📩 Message from ${jid}: "${(text || '(no text)').slice(0, 100)}"`);
 
     if (!text) {
-      await sendText(jid, '⚠️ Text messages only for now.');
+      await sendText(jid, '⚠️ Text only.');
       return;
     }
 
-    // Auto-reconnect CDP if needed
+    console.log(`  ← ${text.slice(0, 80)}`);
+
     if (!cdp.isConnected()) {
-      console.log('🔄 Auto-reconnecting to Antigravity...');
       cdpOk = await cdp.reconnectCDP(CDP_PORT, 3);
       if (!cdpOk) {
-        await sendText(jid, '❌ Antigravity not available. Launch it with:\nantigravity d:\\yaru --remote-debugging-port=' + CDP_PORT);
+        await sendText(jid, '❌ Antigravity not running.\nantigravity d:\\yaru --remote-debugging-port=' + CDP_PORT);
         return;
       }
-      await sendText(jid, '✅ Reconnected to Antigravity!');
+      await sendText(jid, '✅ Connected to Antigravity!');
     }
 
-    // Route to command handler
     await handleMessage(jid, text);
   });
 
-  console.log('🎉 naek is ready! Send a message from WhatsApp.\n');
+  console.log('');
+  console.log('  ✓ naek is ready. Send a WhatsApp message!');
+  console.log('  ─────────────────────────────────────────');
+  console.log('');
 
-  // Handle graceful shutdown
   process.on('SIGINT', async () => {
-    console.log('\n\n👋 Shutting down naek...');
-    monitor.stopPolling();
-    await cdp.disconnectCDP();
-    process.exit(0);
-  });
-
-  process.on('SIGTERM', async () => {
+    console.log('\n  Shutting down...');
     monitor.stopPolling();
     await cdp.disconnectCDP();
     process.exit(0);
   });
 }
 
-// Run
+/**
+ * FIX #13: Wait for a condition to be true, with timeout
+ */
+async function waitForCondition(checkFn, timeoutMs, intervalMs) {
+  const start = Date.now();
+  while (Date.now() - start < timeoutMs) {
+    if (checkFn()) return true;
+    await sleep(intervalMs);
+  }
+  return false;
+}
+
 main().catch((err) => {
-  console.error('💥 Fatal error:', err.message);
+  console.error('Fatal:', err.message);
   process.exit(1);
 });

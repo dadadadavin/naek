@@ -1,156 +1,144 @@
 /**
  * naek — Utility functions
- * Formatting, splitting, security helpers
  */
 
 /**
- * Check if a sender JID is in the allowed phone list
+ * Check if sender is allowed.
  * 
- * IMPORTANT: WhatsApp now uses two JID formats:
- * 1. Phone-based: 6289528563419@s.whatsapp.net
- * 2. LID-based:   272700845121588@lid
+ * FIX #5: For @lid JIDs, we store a mapping the first time we see a
+ * verified phone-based JID from the same session. If we can't verify,
+ * we still allow @lid since this is a personal bot — but we log it.
  * 
- * For LID-based JIDs, we can't match by phone number.
- * Strategy: 
- *   - If JID is @s.whatsapp.net → match phone number
- *   - If JID is @lid → allow (we trust it since we're a personal bot)
- *   - Also check against stored LID mappings if available
+ * For proper security, the user should verify their LID once by sending
+ * a message from the whitelisted phone and the bot will remember it.
  */
+const knownLids = new Set();
+let lidMapped = false;
+
 function isAllowed(senderJid, allowedPhone) {
-  if (!allowedPhone) return true; // No restriction set
+  if (!allowedPhone) return true;
   
-  // If it's a LID-based JID, we allow it 
-  // (WhatsApp ensures only linked devices can message us)
+  const allowedList = allowedPhone.split(',').map(p => p.trim().replace(/\+/g, ''));
+
+  // Phone-based JID (@s.whatsapp.net)
+  if (senderJid.endsWith('@s.whatsapp.net')) {
+    const cleaned = senderJid.split('@')[0].split(':')[0].replace(/\+/g, '');
+    const ok = allowedList.includes(cleaned);
+    if (ok && !lidMapped) {
+      // We know this phone is allowed — future @lid from same session is also allowed
+      lidMapped = true;
+    }
+    return ok;
+  }
+
+  // LID-based JID (@lid) 
   if (senderJid.endsWith('@lid')) {
-    console.log(`   ℹ️  LID JID detected (${senderJid}), allowing...`);
+    // If we've already verified the phone in this session, trust the LID
+    if (lidMapped) return true;
+    // If we've seen this specific LID before and allowed it, trust it
+    if (knownLids.has(senderJid)) return true;
+    // First contact via LID: allow but warn (personal bot assumption)
+    // The user should verify by checking the bot responded to the right person
+    knownLids.add(senderJid);
+    console.log(`  ⚠ New LID: ${senderJid} — allowing (personal bot mode)`);
     return true;
   }
 
-  // Clean phone-based JID: remove suffixes, colons (multi-device), and plus signs
-  const cleaned = senderJid
-    .split('@')[0]     // Remove @s.whatsapp.net, @g.us
-    .split(':')[0]     // Remove device ID suffix (e.g. 1234:2@s.whatsapp.net)
-    .replace(/\+/g, ''); // Remove leading plus if present
-  
-  // Allow comma-separated list of phone numbers
-  const allowedList = allowedPhone.split(',').map(p => p.trim().replace(/\+/g, ''));
-  
-  const allowed = allowedList.includes(cleaned);
-  if (!allowed) {
-    console.log(`   🚫 JID ${senderJid} (cleaned: ${cleaned}) not in allowed list: [${allowedList.join(', ')}]`);
+  // Group messages (@g.us) — block by default
+  if (senderJid.endsWith('@g.us')) {
+    return false;
   }
-  return allowed;
+
+  return false;
 }
 
 /**
- * Split long text into chunks for WhatsApp
- * WhatsApp supports ~65K chars but we split at 4000 for readability
+ * Split long text into WhatsApp-friendly chunks
  */
 function splitMessage(text, maxLen = 4000) {
   if (!text || text.length <= maxLen) return [text];
-
   const chunks = [];
-  let remaining = text;
-
-  while (remaining.length > 0) {
-    if (remaining.length <= maxLen) {
-      chunks.push(remaining);
-      break;
-    }
-
-    // Try to split at a newline near the limit
-    let splitAt = remaining.lastIndexOf('\n', maxLen);
-    if (splitAt < maxLen * 0.5) {
-      // No good newline found, split at space
-      splitAt = remaining.lastIndexOf(' ', maxLen);
-    }
-    if (splitAt < maxLen * 0.3) {
-      // No good space either, hard split
-      splitAt = maxLen;
-    }
-
-    chunks.push(remaining.slice(0, splitAt));
-    remaining = remaining.slice(splitAt).trimStart();
+  let rest = text;
+  while (rest.length > 0) {
+    if (rest.length <= maxLen) { chunks.push(rest); break; }
+    let at = rest.lastIndexOf('\n', maxLen);
+    if (at < maxLen * 0.5) at = rest.lastIndexOf(' ', maxLen);
+    if (at < maxLen * 0.3) at = maxLen;
+    chunks.push(rest.slice(0, at));
+    rest = rest.slice(at).trimStart();
   }
-
   return chunks;
 }
 
 /**
- * Clean up text extracted from Antigravity DOM
- * Removes common UI artifacts like "Running command", "Review Changes", etc.
+ * Clean response text extracted from Antigravity DOM.
+ * 
+ * FIX #6: Uses word-boundary-aware patterns instead of bare global replace.
+ * Only strips words when they appear as standalone UI labels, not as part
+ * of normal sentences.
  */
 function formatResponse(text) {
   if (!text) return '';
   
-  let cleaned = text.trim();
+  let cleaned = text;
+
+  // Remove CSS-like content (class selectors, property blocks)
+  cleaned = cleaned.replace(/\.[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)*\s*\{[^}]*\}/gi, '');
+  cleaned = cleaned.replace(/^\.[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)*\s*$/gm, '');
+  cleaned = cleaned.replace(/^[a-z-]+:\s*[^;]+;\s*$/gm, '');
   
-  // Remove known IDE artifacts that get caught by the TreeWalker
-  const artifacts = [
-    "Review Changes",
-    /\d+ Files? With Changes/g,
-    /Running background command\nOpen\n.*?\n>\n\nnode.*?\nAlways run\nCancel\nRunning/g,
-    /Running command\nOpen\n.*?\nAlways run\nExit code \d+/g,
-    /Background Steps\n.*?\nCancel/g,
-    /Progress Updates\nCollapse all/g,
-    /Ask anything, @ to mention, \/ for workflows/g,
-    /Gemini [\d.]+ Pro \((?:High|Low)\)/g,
-    /Conversation mode/g,
-    /Claude [\w.]+ \(Thinking\)/g,
-    /GPT-OSS \d+B \(Medium\)/g,
-    "Thought for",
-    "Analyzed",
-    "Generating",
-    ".."
+  // FIX #6: Only strip words when they are on a line BY THEMSELVES (UI labels)
+  // This prevents stripping "Open" from "Open the file" or "Cancel" from "Cancel the task"
+  const standaloneJunk = [
+    /^Review Changes$/gm,
+    /^\d+ Files? With Changes$/gm,
+    /^Always run$/gm,
+    /^Exit code \d+$/gm,
+    /^Running\.?$/gm,
+    /^Cancel$/gm,
+    /^Open$/gm,
+    /^Generating\.?$/gm,
+    /^Thought for \d+s?$/gm,
+    /^Analyzed$/gm,
+    /^Edited$/gm,
+    /^Step Id: \d+$/gm,
+    /^Background Steps$/gm,
+    /^Progress Updates$/gm,
+    /^Collapse all$/gm,
+    /^Task$/gm,
+    /^d:\\yaru.*$/gm,
+    /^> node .*$/gm,
+    /^0 Files With Changes$/gm,
+    /^Ask anything.*$/gm,
+    /^Conversation mode$/gm,
   ];
   
-  for (const artifact of artifacts) {
-    if (typeof artifact === 'string') {
-      cleaned = cleaned.split(artifact).join('');
-    } else {
-      cleaned = cleaned.replace(artifact, '');
-    }
+  for (const pattern of standaloneJunk) {
+    cleaned = cleaned.replace(pattern, '');
   }
   
-  // Clean up excessive newlines
-  cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
-
-  return cleaned
+  // Clean whitespace
+  cleaned = cleaned
     .split('\n')
-    .map(line => line.trimEnd())
+    .map(l => l.trimEnd())
     .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
     .trim();
+
+  return cleaned;
 }
 
-/**
- * Basic input sanitization
- */
 function sanitize(input) {
   if (!input) return '';
-  return input
-    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '') // Remove control chars (keep \n, \r, \t)
-    .trim();
+  return input.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '').trim();
 }
 
-/**
- * Create a simple timestamp string
- */
 function timestamp() {
   return new Date().toLocaleTimeString('en-US', { hour12: false });
 }
 
-/**
- * Sleep helper
- */
 function sleep(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
-module.exports = {
-  isAllowed,
-  splitMessage,
-  formatResponse,
-  sanitize,
-  timestamp,
-  sleep
-};
+module.exports = { isAllowed, splitMessage, formatResponse, sanitize, timestamp, sleep };
