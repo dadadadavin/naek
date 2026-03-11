@@ -19,9 +19,6 @@ let messageHandler = null;
 let reconnectAttempts = 0;
 const MAX_RECONNECT = 10;
 
-// FIX #9: Track if handlers are bound to prevent duplicate listeners
-let handlersBound = false;
-
 // Message deduplication
 const processedMsgIds = new Set();
 const MAX_MSG_CACHE = 200;
@@ -48,7 +45,6 @@ async function initWhatsApp() {
     } catch {} 
     sock = null;
   }
-  handlersBound = false;
 
   sock = makeWASocket({
     version,
@@ -121,7 +117,6 @@ async function initWhatsApp() {
     }
   });
 
-  handlersBound = true;
   return sock;
 }
 

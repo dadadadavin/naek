@@ -2,59 +2,62 @@
  * naek — Utility functions
  */
 
-/**
- * Check if sender is allowed.
- * 
- * FIX #5: For @lid JIDs, we store a mapping the first time we see a
- * verified phone-based JID from the same session. If we can't verify,
- * we still allow @lid since this is a personal bot — but we log it.
- * 
- * For proper security, the user should verify their LID once by sending
- * a message from the whitelisted phone and the bot will remember it.
- */
-const knownLids = new Set();
+const fs = require('fs');
+const path = require('path');
+
+// ── LID trust system ──────────────────────────────────────────
+
+const LIDS_FILE = path.join(__dirname, '..', 'known_lids.json');
+let knownLids = new Set();
+try {
+  if (fs.existsSync(LIDS_FILE)) {
+    const data = JSON.parse(fs.readFileSync(LIDS_FILE, 'utf8'));
+    knownLids = new Set(data);
+  }
+} catch (e) {
+  knownLids = new Set();
+}
+
+function saveLids() {
+  try { fs.writeFileSync(LIDS_FILE, JSON.stringify([...knownLids])); } catch (e) {}
+}
+
 let lidMapped = false;
 
 function isAllowed(senderJid, allowedPhone) {
   if (!allowedPhone) return true;
-  
+
   const allowedList = allowedPhone.split(',').map(p => p.trim().replace(/\+/g, ''));
 
-  // Phone-based JID (@s.whatsapp.net)
   if (senderJid.endsWith('@s.whatsapp.net')) {
     const cleaned = senderJid.split('@')[0].split(':')[0].replace(/\+/g, '');
     const ok = allowedList.includes(cleaned);
-    if (ok && !lidMapped) {
-      // We know this phone is allowed — future @lid from same session is also allowed
-      lidMapped = true;
-    }
+    if (ok) lidMapped = true;
     return ok;
   }
 
-  // LID-based JID (@lid) 
   if (senderJid.endsWith('@lid')) {
-    // If we've already verified the phone in this session, trust the LID
-    if (lidMapped) return true;
-    // If we've seen this specific LID before and allowed it, trust it
+    if (lidMapped) {
+      if (!knownLids.has(senderJid)) { knownLids.add(senderJid); saveLids(); }
+      return true;
+    }
     if (knownLids.has(senderJid)) return true;
-    // First contact via LID: allow but warn (personal bot assumption)
-    // The user should verify by checking the bot responded to the right person
-    knownLids.add(senderJid);
-    console.log(`  ⚠ New LID: ${senderJid} — allowing (personal bot mode)`);
-    return true;
-  }
-
-  // Group messages (@g.us) — block by default
-  if (senderJid.endsWith('@g.us')) {
+    if (knownLids.size === 0) {
+      knownLids.add(senderJid);
+      saveLids();
+      console.log(`  ✓ Auto-trusted first LID: ${senderJid}`);
+      return true;
+    }
+    console.log(`  ⚠ Rejecting unknown LID: ${senderJid}`);
     return false;
   }
 
+  if (senderJid.endsWith('@g.us')) return false;
   return false;
 }
 
-/**
- * Split long text into WhatsApp-friendly chunks
- */
+// ── Message splitting ─────────────────────────────────────────
+
 function splitMessage(text, maxLen = 4000) {
   if (!text || text.length <= maxLen) return [text];
   const chunks = [];
@@ -70,53 +73,54 @@ function splitMessage(text, maxLen = 4000) {
   return chunks;
 }
 
+// ── Response formatting ───────────────────────────────────────
+
 /**
- * Clean response text extracted from Antigravity DOM.
+ * Clean response text from DOM scraping.
  * 
- * FIX #6: Uses word-boundary-aware patterns instead of bare global replace.
- * Only strips words when they appear as standalone UI labels, not as part
- * of normal sentences.
+ * IMPORTANT: Does NOT strip code blocks or code lines.
+ * The AI's code answers must pass through intact.
+ * Only strips standalone UI junk labels.
  */
 function formatResponse(text) {
   if (!text) return '';
-  
+
   let cleaned = text;
 
-  // Remove CSS-like content (class selectors, property blocks)
+  // Strip CSS selector blocks: .class-name { ... }
   cleaned = cleaned.replace(/\.[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)*\s*\{[^}]*\}/gi, '');
-  cleaned = cleaned.replace(/^\.[a-z][a-z0-9_-]*(?:\.[a-z][a-z0-9_-]*)*\s*$/gm, '');
+  // Strip standalone CSS property lines
   cleaned = cleaned.replace(/^[a-z-]+:\s*[^;]+;\s*$/gm, '');
-  
-  // FIX #6: Only strip words when they are on a line BY THEMSELVES (UI labels)
-  // This prevents stripping "Open" from "Open the file" or "Cancel" from "Cancel the task"
+
+  // Strip standalone UI junk (lines that are ONLY a UI label)
   const standaloneJunk = [
     /^Review Changes$/gm,
     /^\d+ Files? With Changes$/gm,
     /^Always run$/gm,
-    /^Exit code \d+$/gm,
     /^Running\.?$/gm,
+    /^Working\.?$/gm,
     /^Cancel$/gm,
     /^Open$/gm,
     /^Generating\.?$/gm,
     /^Thought for \d+s?$/gm,
     /^Analyzed$/gm,
     /^Edited$/gm,
-    /^Step Id: \d+$/gm,
     /^Background Steps$/gm,
     /^Progress Updates$/gm,
     /^Collapse all$/gm,
-    /^Task$/gm,
-    /^d:\\yaru.*$/gm,
-    /^> node .*$/gm,
+    /^Expand all$/gm,
     /^0 Files With Changes$/gm,
     /^Ask anything.*$/gm,
     /^Conversation mode$/gm,
+    /^Step Id: \d+$/gm,
+    /^tool call completed$/gm,
+    /^task_boundary$/gm,
   ];
-  
+
   for (const pattern of standaloneJunk) {
     cleaned = cleaned.replace(pattern, '');
   }
-  
+
   // Clean whitespace
   cleaned = cleaned
     .split('\n')

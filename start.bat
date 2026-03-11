@@ -1,19 +1,34 @@
 @echo off
+setlocal enabledelayedexpansion
 title naek - WhatsApp Remote Control for Antigravity
+
 echo.
 echo  ================================================
 echo   naek - WhatsApp Remote Control for Antigravity
 echo  ================================================
 echo.
 
-REM Always run from the project directory
-cd /d "d:\yaru"
+REM Move to directory where script is located
+cd /d "%~dp0"
 
-echo [1/2] Launching Antigravity with CDP on port 9222...
-echo        Working directory: %CD%
-start "" antigravity "%CD%" --remote-debugging-port=9222
+REM Parse .env file
+set CDP_PORT=9222
+set PROJECT_DIR=%CD%
 
-echo Waiting 5 seconds for Antigravity to start...
+if exist .env (
+    for /f "usebackq tokens=1,* delims==" %%A in (".env") do (
+        if "%%A"=="CDP_PORT" set CDP_PORT=%%B
+        if "%%A"=="PROJECT_DIR" set PROJECT_DIR=%%B
+    )
+)
+
+echo [1/2] Launching Antigravity...
+echo       Project Dir: !PROJECT_DIR!
+echo       CDP Port   : !CDP_PORT!
+
+start "" antigravity "!PROJECT_DIR!" --remote-debugging-port=!CDP_PORT!
+
+echo Waiting 5 seconds for Antigravity to boot...
 timeout /t 5 /nobreak >nul
 
 echo [2/2] Starting WhatsApp bot...

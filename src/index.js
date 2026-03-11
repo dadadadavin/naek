@@ -41,9 +41,10 @@ async function main() {
   // FIX #13: Wait up to 15s for WhatsApp to connect, but don't block forever
   const waConnected = await waitForCondition(
     () => {
-      // Check if sock exists and has connected by trying getSocket
+      // Check if sock exists and has user auth
       const { getSocket } = require('./whatsapp');
-      return getSocket() !== null;
+      const s = getSocket();
+      return s !== null && !!s.user;
     },
     15000, 500
   );

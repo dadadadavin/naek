@@ -1,8 +1,14 @@
 /**
  * naek — CDP Bridge to Antigravity
  * 
- * Uses keyboard simulation (Input.dispatchKeyEvent / Input.insertText) to
- * interact with Antigravity's chat. This bypasses all iframe/webview boundaries.
+ * Uses DOM manipulation and keyboard simulation to interact with
+ * Antigravity's chat via Chrome DevTools Protocol.
+ * 
+ * Architecture:
+ *   - DOM focus  → find and click the chat input element
+ *   - insertText → type the prompt
+ *   - Enter      → submit
+ *   - TreeWalker → extract AI response text (skip style/script/svg)
  */
 
 const CDP = require('chrome-remote-interface');
@@ -38,7 +44,7 @@ async function connectCDP(port = 9222) {
     await Runtime.enable();
     await Page.enable();
 
-    // FIX #2: Listen for disconnect so isConnected() never lies
+    // Listen for disconnect so isConnected() never lies
     client.on('disconnect', () => {
       console.log('  ⚠ CDP connection dropped.');
       client = null; Runtime = null; Page = null; Input = null;
@@ -86,57 +92,38 @@ async function pressEscape() { await sendSpecialKey('Escape', 'Escape', 27); }
 // ── Core actions ──────────────────────────────────────────────
 
 /**
- * Focus the chat input by clicking on it via the DOM.
- * Much more reliable than keyboard shortcuts which can disrupt the UI.
+ * Focus the chat input by finding it in the DOM and clicking it.
  */
 async function focusChatInput() {
   if (!Runtime) throw new Error('CDP not connected');
   
   const r = await Runtime.evaluate({
     expression: `(function() {
-      // Strategy 1: Find the textarea/input with "Ask anything" placeholder
+      // Strategy 1: textarea with "Ask anything" placeholder
       var inputs = document.querySelectorAll('textarea, [contenteditable="true"], input[type="text"]');
       for (var i = 0; i < inputs.length; i++) {
         if (inputs[i].placeholder && inputs[i].placeholder.indexOf("Ask anything") !== -1) {
           inputs[i].focus();
           inputs[i].click();
-          return "found-placeholder";
+          return "placeholder";
         }
       }
       
-      // Strategy 2: Find by aria-label
+      // Strategy 2: aria-label
       var labeled = document.querySelector('[aria-label*="Ask anything"]');
       if (labeled) {
         labeled.focus();
         labeled.click();
-        return "found-aria";
+        return "aria";
       }
       
-      // Strategy 3: Find the element containing "Ask anything" and click near it
-      var allEls = document.querySelectorAll('*');
-      for (var j = 0; j < allEls.length; j++) {
-        var el = allEls[j];
-        if (el.children.length === 0 && el.textContent.indexOf("Ask anything") !== -1) {
-          // Found the placeholder text — the input is likely the parent or sibling
-          var parent = el.parentElement;
-          if (parent) {
-            var input = parent.querySelector('textarea, [contenteditable="true"], input');
-            if (input) { input.focus(); input.click(); return "found-near-placeholder"; }
-            // Try the parent itself
-            parent.focus();
-            parent.click();
-            return "found-parent";
-          }
-        }
-      }
-      
-      // Strategy 4: Find any visible textarea
+      // Strategy 3: any visible textarea (skip querySelectorAll('*') — too slow)
       var textareas = document.querySelectorAll('textarea');
       for (var k = 0; k < textareas.length; k++) {
         if (textareas[k].offsetParent !== null) {
           textareas[k].focus();
           textareas[k].click();
-          return "found-visible-textarea";
+          return "textarea";
         }
       }
       
@@ -147,36 +134,27 @@ async function focusChatInput() {
   
   const result = r.result?.value || 'error';
   if (result === 'not-found') {
-    console.log('  ⚠ Chat input not found via DOM, falling back to keyboard');
-    // Last resort: try Ctrl+I or another shortcut specific to Antigravity
-    await sendShortcut('i', 2); // Ctrl+I might focus input in some versions
-    await sleep(300);
+    console.log('  ⚠ Chat input not found via DOM');
   }
   await sleep(300);
 }
 
 /**
  * Inject a prompt into Antigravity's chat.
- * Uses DOM focus (not Ctrl+L) to avoid disrupting the UI.
  */
 async function injectPrompt(text) {
   if (!Input) throw new Error('CDP not connected');
   
-  // Step 1: Focus the chat input via DOM
   await focusChatInput();
   
-  // Step 2: Clear any existing text in the input
-  // Use Home + Shift+End to select, then overwrite, instead of Ctrl+A which selects ALL
-  await sendSpecialKey('Home', 'Home', 36); // Move to start
+  // Clear any existing text: Home → Shift+End → overwrite
+  await sendSpecialKey('Home', 'Home', 36);
   await sleep(50);
-  await sendSpecialKey('End', 'End', 35, 1); // Shift+End = select to end
+  await sendSpecialKey('End', 'End', 35, 1); // Shift+End
   await sleep(50);
   
-  // Step 3: Type the prompt (replaces selection)
   await typeText(text);
   await sleep(200);
-  
-  // Step 4: Submit
   await pressEnter();
   return true;
 }
@@ -192,13 +170,7 @@ async function takeScreenshot() {
 
 /**
  * Get the latest AI response from the chat DOM.
- * 
- * FIX #1: All regex is written as plain JS inside the evaluate string,
- * with correct single-level escaping for the template literal.
- * 
- * FIX #7: Only extracts the LAST assistant message block, not the entire
- * conversation, by scanning backwards from "Ask anything" to find the
- * user's prompt boundary.
+ * Uses TreeWalker to extract text, filters out UI junk via indexOf checks.
  */
 async function getLatestResponse() {
   if (!Runtime) return '';
@@ -209,7 +181,6 @@ async function getLatestResponse() {
         var conv = document.getElementById('conversation');
         if (!conv) return "";
 
-        // Walk text nodes, skip style/script/svg
         var texts = [];
         var walker = document.createTreeWalker(conv, NodeFilter.SHOW_TEXT, {
           acceptNode: function(node) {
@@ -229,72 +200,53 @@ async function getLatestResponse() {
           if (t.length > 0) texts.push(t);
         }
         
-        // Find the input area
-        var idx = -1;
+        // Find "Ask anything" input boundary
+        var inputIdx = -1;
         for (var i = texts.length - 1; i >= 0; i--) {
-          if (texts[i].indexOf("Ask anything") !== -1) { idx = i; break; }
+          if (texts[i].indexOf("Ask anything") !== -1) { inputIdx = i; break; }
         }
-        if (idx === -1) return "";
+        if (inputIdx === -1) return "";
 
-        // Exact-match junk strings
+        var beforeInput = texts.slice(0, inputIdx);
+
+        // Exact-match junk
         var junkSet = {
           "New": 1, "Planning": 1, "Fast": 1, "Conversation mode": 1, "Model": 1,
           "Review Changes": 1, "Always run": 1, "Cancel": 1, "Running": 1, "Running.": 1,
-          "Generating": 1, "..": 1, "Open": 1, "Analyzed": 1, "Edited": 1,
+          "Generating": 1, "Generating.": 1, "..": 1, "Open": 1, "Analyzed": 1, "Edited": 1,
           "0 Files With Changes": 1, "Background Steps": 1, "Progress Updates": 1,
-          "Collapse all": 1, "Task": 1,
+          "Collapse all": 1, "Expand all": 1, "Working": 1, "Working.": 1, "Task": 1,
           "Agent can plan before executing tasks. Use for deep research, complex tasks, or collaborative work": 1,
           "Agent will execute tasks directly. Use for simple tasks that can be completed faster": 1
         };
 
-        // Filter to only text before the input
-        var beforeInput = texts.slice(0, idx);
         var filtered = [];
         for (var j = 0; j < beforeInput.length; j++) {
           var txt = beforeInput[j];
-          // Skip exact junk matches
           if (junkSet[txt]) continue;
-          // Skip model names
           if (txt.indexOf("Gemini ") === 0) continue;
           if (txt.indexOf("Claude ") === 0) continue;
           if (txt.indexOf("GPT-OSS ") === 0) continue;
-          // Skip "Thought for Xs" — check prefix + digit after
           if (txt.indexOf("Thought for ") === 0) continue;
-          // Skip "N Files With Changes" — starts with digit
           if (txt.charAt(0) >= "0" && txt.charAt(0) <= "9" && txt.indexOf("Files") !== -1) continue;
-          // Skip file paths like d:\yaru\...
           if (txt.indexOf("d:" + String.fromCharCode(92)) === 0) continue;
-          // Skip "> node ..." lines
           if (txt.indexOf("> node ") === 0) continue;
-          // Skip "Exit code N"
           if (txt.indexOf("Exit code ") === 0) continue;
-          // Skip CSS selectors: starts with . then a letter
+          if (txt.indexOf("Step Id: ") === 0) continue;
           if (txt.charAt(0) === "." && txt.length > 1 && txt.charAt(1) >= "a" && txt.charAt(1) <= "z") continue;
-          // Skip CSS property lines: "word-word: value;"
           if (txt.indexOf(": ") > 0 && (txt.indexOf(";") !== -1 || txt.indexOf("{") !== -1)) {
             var colonPos = txt.indexOf(": ");
             var beforeColon = txt.substring(0, colonPos);
             if (beforeColon.length < 30 && beforeColon.indexOf(" ") === -1) continue;
           }
-          // Skip large CSS blocks
           if (txt.length > 300 && txt.indexOf("{") !== -1 && txt.indexOf("}") !== -1) continue;
-          // Skip "Step Id: N"
-          if (txt.indexOf("Step Id: ") === 0) continue;
           filtered.push(txt);
         }
-        
-        // FIX #7: Find the last user message boundary
-        // User messages in Antigravity are typically shorter texts followed by
-        // the AI response. We look for the pattern where a short text (user prompt)
-        // is followed by longer content (AI response).
-        // Strategy: scan backwards and find where the latest "turn" starts.
-        // The last message boundary is typically marked by a shift in content density.
-        // For now, take the last 50 text nodes max to avoid sending entire chat history.
-        var maxNodes = 50;
-        if (filtered.length > maxNodes) {
-          filtered = filtered.slice(filtered.length - maxNodes);
+
+        if (filtered.length > 80) {
+          filtered = filtered.slice(filtered.length - 80);
         }
-        
+
         return filtered.join(String.fromCharCode(10));
       })()`,
       returnByValue: true,
@@ -306,17 +258,29 @@ async function getLatestResponse() {
 }
 
 /**
- * Check if Antigravity is generating
+ * Check if Antigravity is actively generating a response
  */
 async function isGenerating() {
   if (!Runtime) return false;
   try {
     const r = await Runtime.evaluate({
       expression: `(function() {
-        var conv = document.getElementById('conversation');
-        if (!conv) return false;
-        var text = conv.innerText;
-        return text.indexOf('Generating') !== -1 || (text.indexOf('Cancel') !== -1 && text.indexOf('Running') !== -1);
+        var spans = document.querySelectorAll('span, div, p');
+        for (var i = 0; i < spans.length; i++) {
+          var el = spans[i];
+          if (el.offsetParent === null) continue;
+          if (el.children.length > 0) continue;
+          var t = el.textContent.trim();
+          if (t === 'Generating' || t === 'Generating.' || t === 'Running' || t === 'Running.' || t === 'Working' || t === 'Working.') {
+            return true;
+          }
+        }
+        var buttons = document.querySelectorAll('button');
+        for (var j = 0; j < buttons.length; j++) {
+          if (buttons[j].offsetParent === null) continue;
+          if (buttons[j].textContent.trim() === 'Stop') return true;
+        }
+        return false;
       })()`,
       returnByValue: true,
     });
@@ -325,7 +289,7 @@ async function isGenerating() {
 }
 
 /**
- * Get current model and mode from the DOM
+ * Get current model and mode
  */
 async function getStatus() {
   if (!Runtime) return { model: 'unknown', mode: 'unknown', connected: false };
@@ -337,8 +301,7 @@ async function getStatus() {
         var text = conv.innerText;
         
         var model = 'unknown';
-        var models = ['Gemini 3.1 Pro (High)', 'Gemini 3.1 Pro (Low)', 'Gemini 3 Flash', 
-                       'Claude Sonnet 4.6 (Thinking)', 'Claude Opus 4.6 (Thinking)', 'GPT-OSS 120B (Medium)'];
+        var models = ['Gemini 2.5 Pro', 'Gemini 2.0 Flash', 'Claude 3.5 Sonnet', 'Claude 3 Opus', 'GPT-4o'];
         for (var i = 0; i < models.length; i++) {
           if (text.indexOf(models[i]) !== -1) { model = models[i]; break; }
         }
@@ -363,7 +326,6 @@ async function stopGeneration() {
 }
 
 async function startNewChat() {
-  // Ctrl+Shift+P → type command → Enter
   await sendSpecialKey('P', 'KeyP', 80, 10); // Ctrl+Shift+P
   await sleep(400);
   await typeText('Antigravity: New Chat');
@@ -373,18 +335,18 @@ async function startNewChat() {
   return true;
 }
 
-// FIX #10: acceptDialog now tries to find and click the actual accept button via DOM
 async function acceptDialog() {
-  if (!Runtime) { return false; }
+  if (!Runtime) return false;
   try {
     const r = await Runtime.evaluate({
       expression: `(function() {
-        // Look for buttons with accept-like text
         var buttons = document.querySelectorAll('button');
         for (var i = 0; i < buttons.length; i++) {
-          var txt = buttons[i].textContent.trim().toLowerCase();
-          if (txt === 'accept' || txt === 'approve' || txt === 'allow' || txt === 'always run' || txt === 'run') {
-            buttons[i].click();
+          var btn = buttons[i];
+          if (btn.offsetParent === null) continue;
+          var txt = btn.textContent.trim().toLowerCase();
+          if (txt === 'accept' || txt === 'approve' || txt === 'allow' || txt === 'always run' || txt === 'run' || txt === 'always allow') {
+            btn.click();
             return true;
           }
         }

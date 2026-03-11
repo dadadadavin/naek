@@ -27,7 +27,7 @@ async function handlePrompt(jid, text) {
 
   try {
     await monitor.captureBaseline();
-    monitor.reset();
+    monitor.reset(text);
     await cdp.injectPrompt(text);
     await sendText(jid, `⚡ _${text.length > 60 ? text.slice(0, 60) + '...' : text}_`);
   } catch (err) {
